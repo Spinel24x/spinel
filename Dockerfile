@@ -13,10 +13,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# کپی همه فایل‌ها از جمله static و templates
 COPY main.py .
-COPY templates/ ./templates/
-COPY static/ ./static/
+COPY worker.js .
 
 RUN mkdir -p /app/configs /app/data
 
