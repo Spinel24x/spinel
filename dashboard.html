@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - VLESS Panel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="main-header">
+            <h1>🚀 VLESS Panel</h1>
+            <div class="header-actions">
+                <span id="userDisplay"></span>
+                <span id="cfStatus"></span>
+                <button class="btn-logout" onclick="doLogout()">🚪 Logout</button>
+            </div>
+        </header>
+
+        <div class="tab-bar">
+            <button class="tab-btn active" data-tab="configs">📡 Configs</button>
+            <button class="tab-btn" data-tab="users">👥 Users</button>
+            <button class="tab-btn" data-tab="me">👤 My Account</button>
+        </div>
+
+        <!-- Configs Tab -->
+        <div class="tab-panel active" id="tab-configs">
+            <div class="card">
+                <h3>➕ Create New Config</h3>
+                <form id="addConfigForm" class="inline-form">
+                    <input type="text" id="cfgName" placeholder="Config Name">
+                    <input type="text" id="cfgRemarks" placeholder="Remarks (shown in VLESS link)">
+                    <input type="number" id="cfgTraffic" placeholder="Traffic Limit (GB)" value="0" min="0">
+                    <input type="number" id="cfgExpire" placeholder="Expire (Days)" value="0" min="0">
+                    <button type="submit" class="btn-primary">Create</button>
+                </form>
+            </div>
+            <div class="card">
+                <h3>📋 Configs List</h3>
+                <div id="configsList">Loading...</div>
+            </div>
+        </div>
+
+        <!-- Users Tab -->
+        <div class="tab-panel" id="tab-users">
+            <div class="card">
+                <h3>➕ Add User</h3>
+                <form id="addUserForm" class="inline-form">
+                    <input type="text" id="newUsername" placeholder="Username" required>
+                    <input type="password" id="newPassword" placeholder="Password" required>
+                    <input type="number" id="assignConfigId" placeholder="Config ID (optional)">
+                    <button type="submit" class="btn-primary">Add User</button>
+                </form>
+            </div>
+            <div class="card">
+                <h3>👥 Users List</h3>
+                <div id="usersList">Loading...</div>
+            </div>
+        </div>
+
+        <!-- My Account Tab -->
+        <div class="tab-panel" id="tab-me">
+            <div class="card">
+                <h3>🔗 My VLESS Config</h3>
+                <div id="myConfig">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+    <script src="/static/script.js"></script>
+</body>
+</html>
