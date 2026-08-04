@@ -5,12 +5,13 @@ import sqlite3
 import subprocess
 import secrets
 import asyncio
+import socket
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Form, HTTPException, WebSocket
+from fastapi import FastAPI, Request, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
 from passlib.context import CryptContext
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -87,7 +88,7 @@ def generate_vless_link(config_uuid: str, remarks: str = "", name: str = "") -> 
         f"vless://{config_uuid}@{CF_DOMAIN}:443"
         f"?encryption=none&security=tls&sni={CF_DOMAIN}"
         f"&fp=chrome&type=ws&host={CF_DOMAIN}"
-        f"&path=%2F{config_uuid}#{remark_text}"
+        f"&path=%2Fws#{remark_text}"
     )
 
 def build_xray_config():
@@ -113,7 +114,7 @@ def build_xray_config():
             "streamSettings": {
                 "network": "ws",
                 "security": "none",
-                "wsSettings": {"path": "/"}
+                "wsSettings": {"path": "/ws"}
             }
         }],
         "outbounds": [{"protocol": "freedom", "settings": {}, "tag": "direct"}]
@@ -239,7 +240,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# ==================== Routes (BEFORE WebSocket) ====================
+# Routes
 @app.get("/", response_class=RedirectResponse)
 async def root(): return RedirectResponse("/login")
 
@@ -359,49 +360,71 @@ async def my_config(request: Request):
 async def health():
     return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped", "cf_domain": CF_DOMAIN or "not set"}
 
-# ==================== WebSocket Proxy (ONLY for UUID paths) ====================
-@app.websocket("/{uuid_path}")
-async def ws_proxy(ws: WebSocket, uuid_path: str):
-    """پروکسی WebSocket فقط برای مسیرهای UUID"""
-    # چک کن ببین UUID معتبره
-    conn = get_db()
-    config = conn.execute("SELECT uuid FROM configs WHERE uuid = ? AND enabled = 1", (uuid_path,)).fetchone()
-    conn.close()
-    
-    if not config:
-        await ws.close(code=4004)
-        return
-    
+# ==================== WebSocket Proxy - Simple TCP ====================
+@app.websocket("/ws")
+async def ws_proxy(ws: WebSocket):
+    """پروکسی ساده WebSocket به Xray"""
     await ws.accept()
+    print("WS: Client connected")
+    
+    # وصل شدن مستقیم به Xray با socket
+    xray_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        import websockets
-        xray_url = f"ws://127.0.0.1:{XRAY_PORT}/{uuid_path}"
+        xray_sock.connect(("127.0.0.1", XRAY_PORT))
+        print(f"WS: Connected to Xray on port {XRAY_PORT}")
         
-        async with websockets.connect(xray_url) as xray_ws:
-            async def c2x():
-                try:
-                    while True:
-                        data = await ws.receive_text()
-                        await xray_ws.send(data)
-                except: pass
-
-            async def x2c():
-                try:
-                    while True:
-                        data = await xray_ws.recv()
-                        await ws.send_text(data)
-                except: pass
-
-            task1 = asyncio.create_task(c2x())
-            task2 = asyncio.create_task(x2c())
-            await asyncio.wait([task1, task2], return_when=asyncio.FIRST_COMPLETED)
-            for t in [task1, task2]:
-                if not t.done(): t.cancel()
+        # ارسال WebSocket upgrade request به Xray
+        upgrade = (
+            "GET /ws HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        xray_sock.send(upgrade.encode())
+        
+        # خوندن response از Xray
+        response = xray_sock.recv(4096)
+        print(f"WS: Xray response: {response[:100]}")
+        
+        if b"101" not in response:
+            print("WS: Xray did not upgrade")
+            await ws.close()
+            return
+        
+        async def forward_from_client():
+            try:
+                while True:
+                    data = await ws.receive_bytes()
+                    xray_sock.send(data)
+            except:
+                pass
+        
+        async def forward_to_client():
+            try:
+                while True:
+                    data = await asyncio.get_event_loop().run_in_executor(None, xray_sock.recv, 4096)
+                    if not data:
+                        break
+                    await ws.send_bytes(data)
+            except:
+                pass
+        
+        task1 = asyncio.create_task(forward_from_client())
+        task2 = asyncio.create_task(forward_to_client())
+        await asyncio.wait([task1, task2], return_when=asyncio.FIRST_COMPLETED)
+        for t in [task1, task2]:
+            if not t.done(): t.cancel()
+            
     except Exception as e:
-        print(f"WS error: {e}")
+        print(f"WS Error: {e}")
     finally:
+        xray_sock.close()
         try: await ws.close()
         except: pass
 
 if __name__ == "__main__":
+    print(f"Starting on port {PANEL_PORT}")
     uvicorn.run("main:app", host="0.0.0.0", port=PANEL_PORT)
