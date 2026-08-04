@@ -83,12 +83,13 @@ xray_process = None
 def generate_vless_link(config_uuid: str, remarks: str = "", name: str = "") -> str:
     if not CF_DOMAIN:
         return ""
+    ws_path = f"/{config_uuid}"
     remark_text = remarks or name or "VLESS"
     return (
         f"vless://{config_uuid}@{CF_DOMAIN}:443"
         f"?encryption=none&security=tls&sni={CF_DOMAIN}"
-        f"&fp=random&type=ws&host={CF_DOMAIN}"
-        f"&path=%2Fws#{remark_text}"
+        f"&fp=chrome&type=ws&host={CF_DOMAIN}"
+        f"&path={ws_path}#{remark_text}"
     )
 
 def build_xray_config():
@@ -96,32 +97,52 @@ def build_xray_config():
     configs = conn.execute("SELECT * FROM configs WHERE enabled = 1").fetchall()
     conn.close()
 
-    clients = []
+    # هر UUID مسیر مخصوص خودش رو داره
+    inbounds = []
     for conf in configs:
-        clients.append({"id": conf["uuid"], "flow": "xtls-rprx-vision"})
-
-    if not clients:
-        clients = [{"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision"}]
-
-    config_data = {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
+        inbounds.append({
             "listen": "127.0.0.1",
-            "port": XRAY_PORT,
+            "port": XRAY_PORT + len(inbounds),
             "protocol": "vless",
-            "settings": {"clients": clients, "decryption": "none"},
+            "settings": {
+                "clients": [{"id": conf["uuid"], "flow": "xtls-rprx-vision"}],
+                "decryption": "none"
+            },
             "streamSettings": {
                 "network": "ws",
                 "security": "none",
-                "wsSettings": {"path": "/ws"}
+                "wsSettings": {"path": f"/{conf['uuid']}"}
             }
-        }],
+        })
+
+    if not inbounds:
+        dummy_uuid = str(uuid.uuid4())
+        inbounds.append({
+            "listen": "127.0.0.1",
+            "port": XRAY_PORT,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": dummy_uuid, "flow": "xtls-rprx-vision"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": f"/{dummy_uuid}"}
+            }
+        })
+
+    config_data = {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
         "outbounds": [{"protocol": "freedom", "settings": {}, "tag": "direct"}]
     }
 
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
     with open("/app/configs/active.json", "w") as f:
         json.dump(config_data, f, indent=2)
+    
+    print("XRAY CONFIG:", json.dumps(config_data, indent=2))
 
 def restart_xray():
     global xray_process
@@ -258,12 +279,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ==================== WebSocket Proxy ====================
-@app.websocket("/ws")
-async def ws_proxy(ws: WebSocket):
+@app.websocket("/{path:path}")
+async def ws_proxy(ws: WebSocket, path: str):
+    """پروکسی WebSocket به Xray با path اصلی"""
     await ws.accept()
     try:
         import websockets
-        async with websockets.connect(f"ws://127.0.0.1:{XRAY_PORT}/ws") as xray_ws:
+        xray_url = f"ws://127.0.0.1:{XRAY_PORT}/{path}"
+        print(f"WS Proxy: /{path} -> {xray_url}")
+        
+        async with websockets.connect(xray_url) as xray_ws:
             async def client_to_xray():
                 try:
                     while True:
@@ -286,7 +311,7 @@ async def ws_proxy(ws: WebSocket):
             for task in pending:
                 task.cancel()
     except Exception as e:
-        print(f"WS Proxy error: {e}")
+        print(f"WS Proxy error for /{path}: {e}")
     finally:
         try:
             await ws.close()
@@ -431,5 +456,4 @@ async def health():
 
 if __name__ == "__main__":
     print(f"Starting on port {PANEL_PORT}")
-    print(f"Xray WS: ws://127.0.0.1:{XRAY_PORT}/ws")
     uvicorn.run("main:app", host="0.0.0.0", port=PANEL_PORT)
