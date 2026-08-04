@@ -85,10 +85,11 @@ def generate_vless_link(config_uuid: str, remarks: str = "", name: str = "") -> 
         return ""
     ws_path = f"/{config_uuid}"
     remark_text = remarks or name or "VLESS"
+    # فرمت استاندارد VLESS بدون alpn
     return (
         f"vless://{config_uuid}@{CF_DOMAIN}:443"
         f"?encryption=none&security=tls&sni={CF_DOMAIN}"
-        f"&alpn=h2,http/1.1&type=ws&host={CF_DOMAIN}"
+        f"&fp=random&type=ws&host={CF_DOMAIN}"
         f"&path={ws_path}#{remark_text}"
     )
 
@@ -96,25 +97,61 @@ def build_xray_config():
     conn = get_db()
     configs = conn.execute("SELECT * FROM configs WHERE enabled = 1").fetchall()
     conn.close()
+
     inbounds = []
+    # همه کانفیگ‌ها روی یه پورت - Xray با path تشخیص میده
+    clients = []
     for conf in configs:
+        clients.append({
+            "id": conf["uuid"],
+            "flow": "xtls-rprx-vision"
+        })
+    
+    if clients:
         inbounds.append({
             "port": XRAY_PORT,
             "protocol": "vless",
-            "settings": {"clients": [{"id": conf["uuid"], "flow": "xtls-rprx-vision"}], "decryption": "none"},
-            "streamSettings": {"network": "ws", "wsSettings": {"path": f"/{conf['uuid']}"}}
+            "settings": {
+                "clients": clients,
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {
+                    "path": "/"
+                }
+            }
         })
-    if not inbounds:
+    else:
         dummy_uuid = str(uuid.uuid4())
         inbounds.append({
             "port": XRAY_PORT,
             "protocol": "vless",
-            "settings": {"clients": [{"id": dummy_uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"},
-            "streamSettings": {"network": "ws", "wsSettings": {"path": f"/{dummy_uuid}"}}
+            "settings": {
+                "clients": [{"id": dummy_uuid, "flow": "xtls-rprx-vision"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {
+                    "path": "/"
+                }
+            }
         })
+
+    config_data = {
+        "log": {"loglevel": "warning"},
+        "inbounds": inbounds,
+        "outbounds": [{"protocol": "freedom", "settings": {}}]
+    }
+
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
     with open("/app/configs/active.json", "w") as f:
-        json.dump({"log": {"loglevel": "warning"}, "inbounds": inbounds, "outbounds": [{"protocol": "freedom", "settings": {}}]}, f, indent=2)
+        json.dump(config_data, f, indent=2)
+    
+    print("XRAY CONFIG:", json.dumps(config_data, indent=2))
 
 def restart_xray():
     global xray_process
@@ -125,7 +162,18 @@ def restart_xray():
     except:
         pass
     build_xray_config()
-    xray_process = subprocess.Popen(["/usr/local/bin/xray", "run", "-config", "/app/configs/active.json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    xray_process = subprocess.Popen(
+        ["/usr/local/bin/xray", "run", "-config", "/app/configs/active.json"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    # لاگ Xray برای دیباگ
+    import threading
+    def log_xray():
+        if xray_process.stdout:
+            for line in xray_process.stdout:
+                print(f"XRAY: {line.decode().strip()}")
+    threading.Thread(target=log_xray, daemon=True).start()
 
 # ==================== Session Manager ====================
 sessions = {}
@@ -142,7 +190,7 @@ def require_admin(request: Request):
         raise HTTPException(status_code=403)
     return user
 
-# ==================== HTML (Simple + Tested) ====================
+# ==================== HTML ====================
 LOGIN_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Login - VLESS</title>
 <style>body{font-family:sans-serif;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
 form{background:#16213e;padding:40px;border-radius:16px;width:350px}
@@ -438,6 +486,15 @@ async def my_config(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped", "cf_domain": CF_DOMAIN or "not set"}
+
+@app.get("/xray-config")
+async def xray_config(request: Request):
+    require_admin(request)
+    try:
+        with open("/app/configs/active.json") as f:
+            return JSONResponse(json.load(f))
+    except:
+        return {"error": "config not found"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
