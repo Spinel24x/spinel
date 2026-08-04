@@ -4,6 +4,8 @@ import uuid
 import sqlite3
 import subprocess
 import secrets
+import socket
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -18,13 +20,12 @@ import uvicorn
 # ==================== Settings ====================
 CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
-PANEL_PORT = int(os.getenv("PORT", "8080"))  # پنل روی این پورت
+PANEL_PORT = int(os.getenv("PORT", "8080"))
 DB_PATH = "/app/data/panel.db"
-XRAY_PORT = 10000  # Xray روی پورت داخلی 10000
+XRAY_PORT = 10000
 
 print("=" * 50)
 print(f"CF_DOMAIN: {CF_DOMAIN or 'NOT SET'}")
-print(f"USER_PASS: {USER_PASS}")
 print(f"Panel Port: {PANEL_PORT}")
 print(f"Xray Port: {XRAY_PORT}")
 print("=" * 50)
@@ -79,6 +80,59 @@ def create_default_admin():
 
 create_default_admin()
 
+# ==================== TCP Proxy for WebSocket ====================
+def tcp_proxy():
+    """پروکسی TCP از پورت 8080 (فقط WebSocket) به Xray روی 10000"""
+    def forward(src, dst):
+        try:
+            while True:
+                data = src.recv(4096)
+                if not data:
+                    break
+                dst.send(data)
+        except:
+            pass
+        finally:
+            src.close()
+            dst.close()
+
+    def handle_client(client_sock):
+        try:
+            # فقط WebSocket handshake رو چک کن
+            data = client_sock.recv(4096)
+            if b"Upgrade: websocket" in data or b"GET /" in data[:100]:
+                # این WebSocket هست - وصلش کن به Xray
+                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                remote.connect(("127.0.0.1", XRAY_PORT))
+                remote.send(data)
+                
+                t1 = threading.Thread(target=forward, args=(client_sock, remote))
+                t2 = threading.Thread(target=forward, args=(remote, client_sock))
+                t1.daemon = True
+                t2.daemon = True
+                t1.start()
+                t2.start()
+                t1.join(timeout=300)
+            else:
+                client_sock.close()
+        except:
+            client_sock.close()
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    
+    try:
+        server.bind(("0.0.0.0", 9090))  # پورت جدا برای TCP proxy
+        server.listen(100)
+        print(f"TCP Proxy listening on 0.0.0.0:9090 -> 127.0.0.1:{XRAY_PORT}")
+        
+        while True:
+            client, addr = server.accept()
+            threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+    except Exception as e:
+        print(f"TCP Proxy error: {e}")
+
 # ==================== Xray Manager ====================
 xray_process = None
 
@@ -101,30 +155,19 @@ def build_xray_config():
 
     clients = []
     for conf in configs:
-        clients.append({
-            "id": conf["uuid"],
-            "flow": "xtls-rprx-vision"
-        })
+        clients.append({"id": conf["uuid"], "flow": "xtls-rprx-vision"})
 
     if not clients:
-        dummy_uuid = str(uuid.uuid4())
-        clients = [{"id": dummy_uuid, "flow": "xtls-rprx-vision"}]
+        clients = [{"id": str(uuid.uuid4()), "flow": "xtls-rprx-vision"}]
 
     config_data = {
         "log": {"loglevel": "warning"},
         "inbounds": [{
-            "listen": "0.0.0.0",
+            "listen": "127.0.0.1",
             "port": XRAY_PORT,
             "protocol": "vless",
-            "settings": {
-                "clients": clients,
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {"path": "/"}
-            }
+            "settings": {"clients": clients, "decryption": "none"},
+            "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/"}}
         }],
         "outbounds": [{"protocol": "freedom", "settings": {}}]
     }
@@ -132,9 +175,6 @@ def build_xray_config():
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
     with open("/app/configs/active.json", "w") as f:
         json.dump(config_data, f, indent=2)
-
-    print("XRAY CONFIG OK")
-    return config_data
 
 def restart_xray():
     global xray_process
@@ -144,19 +184,17 @@ def restart_xray():
             xray_process.wait(timeout=5)
     except:
         pass
-
     build_xray_config()
     xray_process = subprocess.Popen(
         ["/usr/local/bin/xray", "run", "-config", "/app/configs/active.json"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
-    import threading
+    import threading as th
     def log_xray():
         if xray_process and xray_process.stdout:
             for line in xray_process.stdout:
                 print(f"XRAY: {line.decode().strip()}")
-    threading.Thread(target=log_xray, daemon=True).start()
+    th.Thread(target=log_xray, daemon=True).start()
 
 # ==================== Session Manager ====================
 sessions = {}
@@ -214,88 +252,54 @@ input{padding:10px;margin:5px;background:#0f3460;border:none;border-radius:6px;c
 .tok{background:#27ae60}.ter{background:#e74c3c}</style></head><body>
 <div class="h"><h2>VLESS Panel</h2><div><span id="ud"></span> <span id="cd"></span> <button id="lo">Logout</button></div></div>
 <div class="t"><button class="tb ac" data-tab="configs">Configs</button><button class="tb" data-tab="users">Users</button><button class="tb" data-tab="me">Account</button></div>
-
-<div class="pn ac" id="pn-configs">
-<h3 style="color:#7c5cfc">Create Config</h3>
+<div class="pn ac" id="pn-configs"><h3 style="color:#7c5cfc">Create Config</h3>
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
 <input type="text" id="cn" placeholder="Name"><input type="text" id="cr" placeholder="Remarks">
-<input type="number" id="ct" placeholder="Traffic GB" value="0">
-<input type="number" id="ce" placeholder="Expire days" value="0">
-<button class="bt" id="cfs">Create</button></div>
-<h3 style="color:#7c5cfc">Config List</h3><div id="cl"></div></div>
-
-<div class="pn" id="pn-users">
-<h3 style="color:#7c5cfc">Add User</h3>
+<input type="number" id="ct" placeholder="Traffic GB" value="0"><input type="number" id="ce" placeholder="Expire days" value="0">
+<button class="bt" id="cfs">Create</button></div><h3 style="color:#7c5cfc">Config List</h3><div id="cl"></div></div>
+<div class="pn" id="pn-users"><h3 style="color:#7c5cfc">Add User</h3>
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
 <input type="text" id="un" placeholder="Username"><input type="password" id="up" placeholder="Password">
 <input type="number" id="uc" placeholder="Config ID"><button class="bt" id="ufs">Add User</button></div>
 <h3 style="color:#7c5cfc">User List</h3><div id="ul"></div></div>
-
 <div class="pn" id="pn-me"><h3 style="color:#7c5cfc">My Config</h3><div id="mc"></div></div>
 <div class="to" id="to"></div>
-
 <script>
 var isAdmin=false;
 function S(m,t){t=t||'ok';var x=document.getElementById('to');x.textContent=m;x.className='to t'+t;x.style.display='block';setTimeout(function(){x.style.display='none';},3000);}
 function esc(s){return(s||'').replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\'");}
-
 document.getElementById('lo').onclick=async function(){await fetch('/api/logout',{method:'POST'});window.location.href='/login';};
-
 document.querySelectorAll('.tb').forEach(function(b){b.onclick=function(){
 document.querySelectorAll('.tb').forEach(function(x){x.classList.remove('ac');});
 document.querySelectorAll('.pn').forEach(function(x){x.classList.remove('ac');});
-b.classList.add('ac');document.getElementById('pn-'+b.dataset.tab).classList.add('ac');
-};});
-
+b.classList.add('ac');document.getElementById('pn-'+b.dataset.tab).classList.add('ac');};});
 async function LC(){
 var r=await fetch('/api/configs');var c=await r.json();var h=document.getElementById('cl');
 if(!c.length){h.innerHTML='<p style="color:#888">No configs</p>';return;}
 h.innerHTML=c.map(function(x){
 return'<div class="it'+(x.enabled?'':' di')+'"><div class="ii"><strong>'+(x.name||'Unnamed')+'</strong> <span class="bg '+(x.enabled?'bok':'ber')+'">'+(x.enabled?'Active':'Disabled')+'</span>'+(x.remarks?'<br><small>'+x.remarks+'</small>':'')+'<br><code class="uu">'+x.uuid+'</code><br><small>'+x.traffic_used_gb+'/'+(x.traffic_limit_gb||'∞')+' GB | '+(x.expire_at||'Never')+'</small>'+(x.domain_set?'<br><small style="color:#2ecc71">Ready</small>':'<br><small style="color:#e74c3c">No Domain</small>')+'</div><div class="ia">'+(x.vless_link?'<button class="bs bc" onclick="cp(\\''+esc(x.vless_link)+'\\')">Copy</button>':'')+'<button class="bs be" onclick="EC('+x.id+',\\''+esc(x.name)+'\\',\\''+esc(x.remarks)+'\\','+x.traffic_limit_gb+')">Edit</button><button class="bs btg" onclick="TG('+x.id+')">'+(x.enabled?'Disable':'Enable')+'</button><button class="bs bd" onclick="DC('+x.id+')">Del</button></div></div>';}).join('');}
-
 async function TG(id){await fetch('/api/configs/'+id+'/toggle',{method:'PATCH'});LC();}
 async function DC(id){if(!confirm('Delete?'))return;await fetch('/api/configs/'+id,{method:'DELETE'});S('Deleted');LC();}
 async function EC(id,nm,rm,tr){var n=prompt('Name:',nm);if(n===null)return;var r=prompt('Remarks:',rm);if(r===null)return;var t=prompt('Traffic:',tr);if(t===null)return;var f=new FormData();f.append('name',n);f.append('remarks',r);f.append('traffic_limit_gb',t);f.append('expire_days','0');var x=await fetch('/api/configs/'+id,{method:'PUT',body:f});var j=await x.json();if(j.success){S('Updated');LC();}else{S('Error','err');}}
 function cp(link){navigator.clipboard.writeText(link).then(function(){S('Copied!');}).catch(function(){prompt('Copy:',link);});}
-
-async function LU(){
-var r=await fetch('/api/users');var u=await r.json();var h=document.getElementById('ul');
-if(!u.length){h.innerHTML='<p style="color:#888">No users</p>';return;}
-h.innerHTML=u.map(function(x){
-return'<div class="it"><div class="ii"><strong>'+x.username+(x.is_admin?' <span style="color:#f39c12">(Admin)</span>':'')+'</strong>'+(x.config_name?'<br><small>Config: '+x.config_name+'</small>':'<br><small style="color:#888">No config</small>')+'</div><div class="ia">'+(!x.is_admin?'<button class="bs bd" onclick="DU('+x.id+')">Del</button>':'')+'</div></div>';}).join('');}
+async function LU(){var r=await fetch('/api/users');var u=await r.json();var h=document.getElementById('ul');if(!u.length){h.innerHTML='<p style="color:#888">No users</p>';return;}h.innerHTML=u.map(function(x){return'<div class="it"><div class="ii"><strong>'+x.username+(x.is_admin?' <span style="color:#f39c12">(Admin)</span>':'')+'</strong>'+(x.config_name?'<br><small>Config: '+x.config_name+'</small>':'<br><small style="color:#888">No config</small>')+'</div><div class="ia">'+(!x.is_admin?'<button class="bs bd" onclick="DU('+x.id+')">Del</button>':'')+'</div></div>';}).join('');}
 async function DU(id){if(!confirm('Delete?'))return;await fetch('/api/users/'+id,{method:'DELETE'});S('Deleted');LU();}
-
-async function LMC(){
-var r=await fetch('/api/my-config');var d=await r.json();var h=document.getElementById('mc');
-if(!d.has_config){h.innerHTML='<p style="color:#888">No config assigned.</p>';return;}
-h.innerHTML='<p><strong>Name:</strong> '+(d.name||'Unnamed')+'</p>'+(d.remarks?'<p><strong>Remarks:</strong> '+d.remarks+'</p>':'')+'<p><strong>UUID:</strong> <code style="color:#7c5cfc">'+d.uuid+'</code></p>'+(d.vless_link?'<p style="color:#2ecc71">Ready</p><button class="bt" onclick="cp(\\''+esc(d.vless_link)+'\\')">Copy Link</button>':'<p style="color:#e74c3c">No domain configured</p>');}
-
+async function LMC(){var r=await fetch('/api/my-config');var d=await r.json();var h=document.getElementById('mc');if(!d.has_config){h.innerHTML='<p style="color:#888">No config assigned.</p>';return;}h.innerHTML='<p><strong>Name:</strong> '+(d.name||'Unnamed')+'</p>'+(d.remarks?'<p><strong>Remarks:</strong> '+d.remarks+'</p>':'')+'<p><strong>UUID:</strong> <code style="color:#7c5cfc">'+d.uuid+'</code></p>'+(d.vless_link?'<p style="color:#2ecc71">Ready</p><button class="bt" onclick="cp(\\''+esc(d.vless_link)+'\\')">Copy Link</button>':'<p style="color:#e74c3c">No domain configured</p>');}
 document.addEventListener('DOMContentLoaded',async function(){
-try{
-var r=await fetch('/api/me');if(!r.ok){window.location.href='/login';return;}
-var u=await r.json();isAdmin=u.is_admin;
+try{var r=await fetch('/api/me');if(!r.ok){window.location.href='/login';return;}var u=await r.json();isAdmin=u.is_admin;
 document.getElementById('ud').textContent=u.username+(u.is_admin?' (Admin)':'');
 var hr=await fetch('/health');var h=await hr.json();
 document.getElementById('cd').innerHTML=h.cf_domain&&h.cf_domain!=='not set'?'<span class="bg bok">Domain OK</span>':'<span class="bg ber">No Domain</span>';
-
-document.getElementById('cfs').onclick=async function(){
-var f=new FormData();f.append('name',document.getElementById('cn').value);f.append('remarks',document.getElementById('cr').value);f.append('traffic_limit_gb',document.getElementById('ct').value);f.append('expire_days',document.getElementById('ce').value);
-var x=await fetch('/api/configs',{method:'POST',body:f});var j=await x.json();
-if(j.success){S('Created!');document.getElementById('cn').value='';document.getElementById('cr').value='';document.getElementById('ct').value='0';document.getElementById('ce').value='0';LC();}else{S('Error','err');}};
-
-document.getElementById('ufs').onclick=async function(){
-var f=new FormData();f.append('username',document.getElementById('un').value);f.append('password',document.getElementById('up').value);var cid=document.getElementById('uc').value;if(cid)f.append('config_id',cid);
-var x=await fetch('/api/users',{method:'POST',body:f});var j=await x.json();
-if(j.success){S('User added!');document.getElementById('un').value='';document.getElementById('up').value='';document.getElementById('uc').value='';LU();}else{S(j.detail||'Error','err');}};
-
-if(isAdmin){LC();LU();}else{document.querySelectorAll('.tb').forEach(function(b){if(b.dataset.tab!=='me')b.style.display='none';});LMC();}
-}catch(ex){window.location.href='/login';}});
+document.getElementById('cfs').onclick=async function(){var f=new FormData();f.append('name',document.getElementById('cn').value);f.append('remarks',document.getElementById('cr').value);f.append('traffic_limit_gb',document.getElementById('ct').value);f.append('expire_days',document.getElementById('ce').value);var x=await fetch('/api/configs',{method:'POST',body:f});var j=await x.json();if(j.success){S('Created!');document.getElementById('cn').value='';document.getElementById('cr').value='';document.getElementById('ct').value='0';document.getElementById('ce').value='0';LC();}else{S('Error','err');}};
+document.getElementById('ufs').onclick=async function(){var f=new FormData();f.append('username',document.getElementById('un').value);f.append('password',document.getElementById('up').value);var cid=document.getElementById('uc').value;if(cid)f.append('config_id',cid);var x=await fetch('/api/users',{method:'POST',body:f});var j=await x.json();if(j.success){S('User added!');document.getElementById('un').value='';document.getElementById('up').value='';document.getElementById('uc').value='';LU();}else{S(j.detail||'Error','err');}};
+if(isAdmin){LC();LU();}else{document.querySelectorAll('.tb').forEach(function(b){if(b.dataset.tab!=='me')b.style.display='none';});LMC();}}catch(ex){window.location.href='/login';}});
 </script></body></html>"""
 
 # ==================== FastAPI App ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     restart_xray()
+    threading.Thread(target=tcp_proxy, daemon=True).start()
     scheduler = BackgroundScheduler()
     scheduler.add_job(restart_xray, 'interval', hours=6)
     scheduler.start()
@@ -306,12 +310,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/", response_class=RedirectResponse)
-async def root():
-    return RedirectResponse("/login")
+async def root(): return RedirectResponse("/login")
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page():
-    return HTMLResponse(content=LOGIN_HTML)
+async def login_page(): return HTMLResponse(content=LOGIN_HTML)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page(request: Request):
@@ -337,8 +339,7 @@ async def api_login(response: Response, username: str = Form(...), password: str
 @app.post("/api/logout")
 async def api_logout(request: Request):
     session_id = request.cookies.get("session_id")
-    if session_id and session_id in sessions:
-        del sessions[session_id]
+    if session_id and session_id in sessions: del sessions[session_id]
     resp = JSONResponse({"success": True})
     resp.delete_cookie("session_id", path="/")
     return resp
@@ -363,8 +364,7 @@ async def create_config(request: Request, name: str = Form(""), remarks: str = F
     expire_at = (datetime.now() + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S") if expire_days > 0 else None
     conn = get_db()
     conn.execute("INSERT INTO configs (uuid, name, remarks, traffic_limit_gb, expire_at) VALUES (?, ?, ?, ?, ?)", (new_uuid, name or "Unnamed", remarks, traffic_limit_gb, expire_at))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     restart_xray()
     return {"success": True, "uuid": new_uuid, "link": generate_vless_link(new_uuid, remarks, name), "domain_set": bool(CF_DOMAIN)}
 
@@ -374,8 +374,7 @@ async def update_config(request: Request, config_id: int, name: str = Form(""), 
     expire_at = (datetime.now() + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S") if expire_days > 0 else None
     conn = get_db()
     conn.execute("UPDATE configs SET name=?, remarks=?, traffic_limit_gb=?, expire_at=? WHERE id=?", (name, remarks, traffic_limit_gb, expire_at, config_id))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     restart_xray()
     return {"success": True}
 
@@ -385,8 +384,7 @@ async def delete_config(request: Request, config_id: int):
     conn = get_db()
     conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
     conn.execute("UPDATE users SET config_id = NULL WHERE config_id = ?", (config_id,))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     restart_xray()
     return {"success": True}
 
@@ -419,46 +417,33 @@ async def create_user(request: Request, username: str = Form(...), password: str
         conn.execute("INSERT INTO users (username, password, config_id) VALUES (?, ?, ?)", (username, hashed, config_id))
         conn.commit()
         return {"success": True}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="Username already exists")
-    finally:
-        conn.close()
+    except sqlite3.IntegrityError: raise HTTPException(status_code=400, detail="Username already exists")
+    finally: conn.close()
 
 @app.delete("/api/users/{user_id}")
 async def delete_user(request: Request, user_id: int):
     require_admin(request)
     conn = get_db()
     user = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
-    if user and user["username"] == "admin":
-        conn.close()
-        raise HTTPException(status_code=400, detail="Cannot delete admin")
+    if user and user["username"] == "admin": conn.close(); raise HTTPException(status_code=400, detail="Cannot delete admin")
     conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     return {"success": True}
 
 @app.get("/api/my-config")
 async def my_config(request: Request):
     user = get_current_user(request)
-    if not user.get("config_id"):
-        return {"has_config": False}
+    if not user.get("config_id"): return {"has_config": False}
     conn = get_db()
     row = conn.execute("SELECT * FROM configs WHERE id = ?", (user["config_id"],)).fetchone()
     conn.close()
-    if not row:
-        return {"has_config": False}
+    if not row: return {"has_config": False}
     return {"has_config": True, "id": row["id"], "uuid": row["uuid"], "name": row["name"], "remarks": row["remarks"], "vless_link": generate_vless_link(row["uuid"], row["remarks"], row["name"]), "domain_set": bool(CF_DOMAIN)}
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped",
-        "xray_port": XRAY_PORT,
-        "cf_domain": CF_DOMAIN or "not set"
-    }
+    return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped", "xray_port": XRAY_PORT, "cf_domain": CF_DOMAIN or "not set"}
 
 if __name__ == "__main__":
-    print(f"Panel: http://0.0.0.0:{PANEL_PORT}")
-    print(f"Xray: 0.0.0.0:{XRAY_PORT}")
+    print(f"Panel: http://0.0.0.0:{PANEL_PORT} | Xray: 127.0.0.1:{XRAY_PORT}")
     uvicorn.run("main:app", host="0.0.0.0", port=PANEL_PORT)
