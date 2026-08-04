@@ -4,14 +4,13 @@ import uuid
 import sqlite3
 import subprocess
 import secrets
-import socket
-import threading
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import FastAPI, Request, Form, HTTPException, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, Response
 from passlib.context import CryptContext
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,12 +21,11 @@ CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
 PANEL_PORT = int(os.getenv("PORT", "8080"))
 DB_PATH = "/app/data/panel.db"
-XRAY_PORT = 10000
+XRAY_PORT = 10000  # Xray داخلی
 
 print("=" * 50)
 print(f"CF_DOMAIN: {CF_DOMAIN or 'NOT SET'}")
-print(f"Panel Port: {PANEL_PORT}")
-print(f"Xray Port: {XRAY_PORT}")
+print(f"Panel: {PANEL_PORT} | Xray: {XRAY_PORT}")
 print("=" * 50)
 
 # ==================== Database ====================
@@ -64,7 +62,6 @@ def init_db():
 
 init_db()
 
-# ==================== Password Hashing ====================
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 def create_default_admin():
@@ -80,72 +77,18 @@ def create_default_admin():
 
 create_default_admin()
 
-# ==================== TCP Proxy for WebSocket ====================
-def tcp_proxy():
-    """پروکسی TCP از پورت 8080 (فقط WebSocket) به Xray روی 10000"""
-    def forward(src, dst):
-        try:
-            while True:
-                data = src.recv(4096)
-                if not data:
-                    break
-                dst.send(data)
-        except:
-            pass
-        finally:
-            src.close()
-            dst.close()
-
-    def handle_client(client_sock):
-        try:
-            # فقط WebSocket handshake رو چک کن
-            data = client_sock.recv(4096)
-            if b"Upgrade: websocket" in data or b"GET /" in data[:100]:
-                # این WebSocket هست - وصلش کن به Xray
-                remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                remote.connect(("127.0.0.1", XRAY_PORT))
-                remote.send(data)
-                
-                t1 = threading.Thread(target=forward, args=(client_sock, remote))
-                t2 = threading.Thread(target=forward, args=(remote, client_sock))
-                t1.daemon = True
-                t2.daemon = True
-                t1.start()
-                t2.start()
-                t1.join(timeout=300)
-            else:
-                client_sock.close()
-        except:
-            client_sock.close()
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    
-    try:
-        server.bind(("0.0.0.0", 9090))  # پورت جدا برای TCP proxy
-        server.listen(100)
-        print(f"TCP Proxy listening on 0.0.0.0:9090 -> 127.0.0.1:{XRAY_PORT}")
-        
-        while True:
-            client, addr = server.accept()
-            threading.Thread(target=handle_client, args=(client,), daemon=True).start()
-    except Exception as e:
-        print(f"TCP Proxy error: {e}")
-
 # ==================== Xray Manager ====================
 xray_process = None
 
 def generate_vless_link(config_uuid: str, remarks: str = "", name: str = "") -> str:
     if not CF_DOMAIN:
         return ""
-    ws_path = f"/{config_uuid}"
     remark_text = remarks or name or "VLESS"
     return (
         f"vless://{config_uuid}@{CF_DOMAIN}:443"
         f"?encryption=none&security=tls&sni={CF_DOMAIN}"
         f"&fp=random&type=ws&host={CF_DOMAIN}"
-        f"&path={ws_path}#{remark_text}"
+        f"&path=%2Fws#{remark_text}"
     )
 
 def build_xray_config():
@@ -167,9 +110,17 @@ def build_xray_config():
             "port": XRAY_PORT,
             "protocol": "vless",
             "settings": {"clients": clients, "decryption": "none"},
-            "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/"}}
+            "streamSettings": {
+                "network": "ws",
+                "security": "none",
+                "wsSettings": {"path": "/ws"}
+            }
         }],
-        "outbounds": [{"protocol": "freedom", "settings": {}}]
+        "outbounds": [{
+            "protocol": "freedom",
+            "settings": {},
+            "tag": "direct"
+        }]
     }
 
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
@@ -189,14 +140,16 @@ def restart_xray():
         ["/usr/local/bin/xray", "run", "-config", "/app/configs/active.json"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
-    import threading as th
+    import threading
     def log_xray():
         if xray_process and xray_process.stdout:
             for line in xray_process.stdout:
-                print(f"XRAY: {line.decode().strip()}")
-    th.Thread(target=log_xray, daemon=True).start()
+                line_str = line.decode().strip()
+                if line_str:
+                    print(f"XRAY: {line_str}")
+    threading.Thread(target=log_xray, daemon=True).start()
 
-# ==================== Session Manager ====================
+# ==================== Session ====================
 sessions = {}
 
 def get_current_user(request: Request):
@@ -212,25 +165,25 @@ def require_admin(request: Request):
     return user
 
 # ==================== HTML ====================
-LOGIN_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Login - VLESS</title>
+LOGIN_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Login</title>
 <style>body{font-family:sans-serif;background:#1a1a2e;color:#eee;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
 form{background:#16213e;padding:40px;border-radius:16px;width:350px}
 h2{color:#7c5cfc;text-align:center}input{width:100%;padding:12px;margin:10px 0;background:#0f3460;border:none;border-radius:8px;color:#fff}
 button{width:100%;padding:14px;background:#7c5cfc;border:none;border-radius:8px;color:#fff;font-weight:bold;cursor:pointer}
 #e{color:#ff6b6b;text-align:center;display:none}</style></head><body>
-<form id="f"><h2>VLESS Panel Login</h2>
+<form id="f"><h2>VLESS Panel</h2>
 <input type="text" id="u" placeholder="Username (admin)" required>
 <input type="password" id="p" placeholder="Password" required>
 <div id="e"></div><button type="submit">Login</button></form>
 <script>
-document.getElementById('f').onsubmit=async function(ev){ev.preventDefault();
-var e=document.getElementById('e');e.style.display='none';
+document.getElementById('f').onsubmit=async function(e){e.preventDefault();
+var err=document.getElementById('e');err.style.display='none';
 var d=new FormData();d.append('username',document.getElementById('u').value);d.append('password',document.getElementById('p').value);
 try{var r=await fetch('/api/login',{method:'POST',body:d});var j=await r.json();
-if(r.ok){window.location.href=j.redirect;}else{e.textContent=j.detail||'Error';e.style.display='block';}
-}catch(ex){e.textContent='Connection error';e.style.display='block';}};</script></body></html>"""
+if(r.ok){window.location.href=j.redirect;}else{err.textContent=j.detail||'Error';err.style.display='block';}
+}catch(ex){err.textContent='Connection error';err.style.display='block';}};</script></body></html>"""
 
-DASHBOARD_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Dashboard - VLESS</title>
+DASHBOARD_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Dashboard</title>
 <style>body{font-family:sans-serif;background:#1a1a2e;color:#eee;margin:0;padding:20px}
 .h{display:flex;justify-content:space-between;align-items:center;background:#16213e;padding:15px 25px;border-radius:12px;margin-bottom:20px}
 .h h2{color:#7c5cfc;margin:0}.h span{color:#aaa;font-size:14px}
@@ -295,11 +248,42 @@ document.getElementById('ufs').onclick=async function(){var f=new FormData();f.a
 if(isAdmin){LC();LU();}else{document.querySelectorAll('.tb').forEach(function(b){if(b.dataset.tab!=='me')b.style.display='none';});LMC();}}catch(ex){window.location.href='/login';}});
 </script></body></html>"""
 
+# ==================== WebSocket Proxy ====================
+# مسیر /ws مستقیم به Xray پروکسی میشه
+@app.websocket("/ws")
+async def ws_proxy(ws: WebSocket):
+    await ws.accept()
+    # وصل شدن به Xray
+    import websockets
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{XRAY_PORT}/ws") as xray_ws:
+            async def forward(src, dst):
+                try:
+                    while True:
+                        data = await src.receive_text()
+                        await dst.send(data)
+                except:
+                    pass
+            
+            # دو طرفه
+            task1 = asyncio.create_task(forward(ws, xray_ws))
+            task2 = asyncio.create_task(forward(xray_ws, ws))
+            
+            done, pending = await asyncio.wait(
+                [task1, task2],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            for task in pending:
+                task.cancel()
+    except Exception as e:
+        print(f"WS Proxy error: {e}")
+        await ws.close()
+
 # ==================== FastAPI App ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     restart_xray()
-    threading.Thread(target=tcp_proxy, daemon=True).start()
     scheduler = BackgroundScheduler()
     scheduler.add_job(restart_xray, 'interval', hours=6)
     scheduler.start()
@@ -445,5 +429,7 @@ async def health():
     return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped", "xray_port": XRAY_PORT, "cf_domain": CF_DOMAIN or "not set"}
 
 if __name__ == "__main__":
-    print(f"Panel: http://0.0.0.0:{PANEL_PORT} | Xray: 127.0.0.1:{XRAY_PORT}")
+    print(f"Starting on port {PANEL_PORT}")
+    print(f"Xray on 127.0.0.1:{XRAY_PORT}")
+    print(f"WebSocket path: /ws")
     uvicorn.run("main:app", host="0.0.0.0", port=PANEL_PORT)
