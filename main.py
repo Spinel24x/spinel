@@ -18,15 +18,15 @@ import uvicorn
 # ==================== Settings ====================
 CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
-PORT = int(os.getenv("PORT", "8000"))
+PANEL_PORT = int(os.getenv("PORT", "8080"))  # پنل روی این پورت
 DB_PATH = "/app/data/panel.db"
-XRAY_PORT = 8080  # Railway فقط این پورت رو expose می‌کنه
-# ولی ما Xray رو روی 8081 می‌ذاریم و FastAPI رو 8080
-# Worker باید به 8081 وصل بشه برای WS
+XRAY_PORT = 10000  # Xray روی پورت داخلی 10000
 
 print("=" * 50)
 print(f"CF_DOMAIN: {CF_DOMAIN or 'NOT SET'}")
 print(f"USER_PASS: {USER_PASS}")
+print(f"Panel Port: {PANEL_PORT}")
+print(f"Xray Port: {XRAY_PORT}")
 print("=" * 50)
 
 # ==================== Database ====================
@@ -123,9 +123,7 @@ def build_xray_config():
             "streamSettings": {
                 "network": "ws",
                 "security": "none",
-                "wsSettings": {
-                    "path": "/"
-                }
+                "wsSettings": {"path": "/"}
             }
         }],
         "outbounds": [{"protocol": "freedom", "settings": {}}]
@@ -135,7 +133,7 @@ def build_xray_config():
     with open("/app/configs/active.json", "w") as f:
         json.dump(config_data, f, indent=2)
 
-    print("XRAY CONFIG:", json.dumps(config_data, indent=2))
+    print("XRAY CONFIG OK")
     return config_data
 
 def restart_xray():
@@ -148,15 +146,11 @@ def restart_xray():
         pass
 
     build_xray_config()
-    
-    # Xray رو روی پورت 8080 ران می‌کنیم
-    # FastAPI روی پورت 8000 ران میشه (ست شده توسط Railway)
     xray_process = subprocess.Popen(
         ["/usr/local/bin/xray", "run", "-config", "/app/configs/active.json"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT
     )
-    
     import threading
     def log_xray():
         if xray_process and xray_process.stdout:
@@ -457,11 +451,14 @@ async def my_config(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped", "cf_domain": CF_DOMAIN or "not set"}
+    return {
+        "status": "ok",
+        "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped",
+        "xray_port": XRAY_PORT,
+        "cf_domain": CF_DOMAIN or "not set"
+    }
 
 if __name__ == "__main__":
-    # FastAPI روی پورت 8000 (که Railway به 8080 مپ می‌کنه)
-    # Xray روی 8080 داخلی
-    print(f"FastAPI starting on port {PORT}")
-    print(f"Xray will listen on port {XRAY_PORT} internally")
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+    print(f"Panel: http://0.0.0.0:{PANEL_PORT}")
+    print(f"Xray: 0.0.0.0:{XRAY_PORT}")
+    uvicorn.run("main:app", host="0.0.0.0", port=PANEL_PORT)
