@@ -21,7 +21,7 @@ CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
 PANEL_PORT = int(os.getenv("PORT", "8080"))
 DB_PATH = "/app/data/panel.db"
-XRAY_PORT = 10000  # Xray داخلی
+XRAY_PORT = 10000
 
 print("=" * 50)
 print(f"CF_DOMAIN: {CF_DOMAIN or 'NOT SET'}")
@@ -116,11 +116,7 @@ def build_xray_config():
                 "wsSettings": {"path": "/ws"}
             }
         }],
-        "outbounds": [{
-            "protocol": "freedom",
-            "settings": {},
-            "tag": "direct"
-        }]
+        "outbounds": [{"protocol": "freedom", "settings": {}, "tag": "direct"}]
     }
 
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
@@ -248,38 +244,6 @@ document.getElementById('ufs').onclick=async function(){var f=new FormData();f.a
 if(isAdmin){LC();LU();}else{document.querySelectorAll('.tb').forEach(function(b){if(b.dataset.tab!=='me')b.style.display='none';});LMC();}}catch(ex){window.location.href='/login';}});
 </script></body></html>"""
 
-# ==================== WebSocket Proxy ====================
-# مسیر /ws مستقیم به Xray پروکسی میشه
-@app.websocket("/ws")
-async def ws_proxy(ws: WebSocket):
-    await ws.accept()
-    # وصل شدن به Xray
-    import websockets
-    try:
-        async with websockets.connect(f"ws://127.0.0.1:{XRAY_PORT}/ws") as xray_ws:
-            async def forward(src, dst):
-                try:
-                    while True:
-                        data = await src.receive_text()
-                        await dst.send(data)
-                except:
-                    pass
-            
-            # دو طرفه
-            task1 = asyncio.create_task(forward(ws, xray_ws))
-            task2 = asyncio.create_task(forward(xray_ws, ws))
-            
-            done, pending = await asyncio.wait(
-                [task1, task2],
-                return_when=asyncio.FIRST_COMPLETED
-            )
-            
-            for task in pending:
-                task.cancel()
-    except Exception as e:
-        print(f"WS Proxy error: {e}")
-        await ws.close()
-
 # ==================== FastAPI App ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -293,6 +257,43 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# ==================== WebSocket Proxy ====================
+@app.websocket("/ws")
+async def ws_proxy(ws: WebSocket):
+    await ws.accept()
+    try:
+        import websockets
+        async with websockets.connect(f"ws://127.0.0.1:{XRAY_PORT}/ws") as xray_ws:
+            async def client_to_xray():
+                try:
+                    while True:
+                        data = await ws.receive_text()
+                        await xray_ws.send(data)
+                except:
+                    pass
+
+            async def xray_to_client():
+                try:
+                    while True:
+                        data = await xray_ws.recv()
+                        await ws.send_text(data)
+                except:
+                    pass
+
+            task1 = asyncio.create_task(client_to_xray())
+            task2 = asyncio.create_task(xray_to_client())
+            done, pending = await asyncio.wait([task1, task2], return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+    except Exception as e:
+        print(f"WS Proxy error: {e}")
+    finally:
+        try:
+            await ws.close()
+        except:
+            pass
+
+# ==================== Routes ====================
 @app.get("/", response_class=RedirectResponse)
 async def root(): return RedirectResponse("/login")
 
@@ -430,6 +431,5 @@ async def health():
 
 if __name__ == "__main__":
     print(f"Starting on port {PANEL_PORT}")
-    print(f"Xray on 127.0.0.1:{XRAY_PORT}")
-    print(f"WebSocket path: /ws")
+    print(f"Xray WS: ws://127.0.0.1:{XRAY_PORT}/ws")
     uvicorn.run("main:app", host="0.0.0.0", port=PANEL_PORT)
