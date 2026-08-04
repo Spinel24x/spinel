@@ -642,4 +642,102 @@ async def create_config(
     return {"success": True, "uuid": new_uuid, "link": generate_vless_link(new_uuid, remarks, name), "domain_set": bool(CF_DOMAIN)}
 
 @app.put("/api/configs/{config_id}")
-async def update
+async def update_config(
+    request: Request, config_id: int, name: str = Form(""),
+    remarks: str = Form(""), traffic_limit_gb: float = Form(0), expire_days: int = Form(0)
+):
+    require_admin(request)
+    expire_at = (datetime.now() + timedelta(days=expire_days)).strftime("%Y-%m-%d %H:%M:%S") if expire_days > 0 else None
+    conn = get_db()
+    conn.execute("UPDATE configs SET name=?, remarks=?, traffic_limit_gb=?, expire_at=? WHERE id=?",
+                 (name, remarks, traffic_limit_gb, expire_at, config_id))
+    conn.commit()
+    conn.close()
+    restart_xray()
+    return {"success": True}
+
+@app.delete("/api/configs/{config_id}")
+async def delete_config(request: Request, config_id: int):
+    require_admin(request)
+    conn = get_db()
+    conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
+    conn.execute("UPDATE users SET config_id = NULL WHERE config_id = ?", (config_id,))
+    conn.commit()
+    conn.close()
+    restart_xray()
+    return {"success": True}
+
+@app.patch("/api/configs/{config_id}/toggle")
+async def toggle_config(request: Request, config_id: int):
+    require_admin(request)
+    conn = get_db()
+    row = conn.execute("SELECT enabled FROM configs WHERE id = ?", (config_id,)).fetchone()
+    if row:
+        conn.execute("UPDATE configs SET enabled = ? WHERE id = ?", (0 if row["enabled"] else 1, config_id))
+        conn.commit()
+        restart_xray()
+    conn.close()
+    return {"success": True}
+
+# ==================== Users API ====================
+@app.get("/api/users")
+async def get_users(request: Request):
+    require_admin(request)
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT u.id, u.username, u.is_admin, u.config_id, c.uuid as cuuid, c.name as cname
+        FROM users u LEFT JOIN configs c ON u.config_id = c.id ORDER BY u.id DESC
+    """).fetchall()
+    conn.close()
+    return [{"id": r["id"], "username": r["username"], "is_admin": bool(r["is_admin"]),
+             "config_id": r["config_id"], "config_uuid": r["cuuid"], "config_name": r["cname"]} for r in rows]
+
+@app.post("/api/users")
+async def create_user(request: Request, username: str = Form(...), password: str = Form(...),
+                      config_id: Optional[int] = Form(None)):
+    require_admin(request)
+    hashed = pwd_context.hash(password)
+    conn = get_db()
+    try:
+        conn.execute("INSERT INTO users (username, password, config_id) VALUES (?, ?, ?)", (username, hashed, config_id))
+        conn.commit()
+        return {"success": True}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    finally:
+        conn.close()
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(request: Request, user_id: int):
+    require_admin(request)
+    conn = get_db()
+    user = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+    if user and user["username"] == "admin":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Cannot delete admin")
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"success": True}
+
+@app.get("/api/my-config")
+async def my_config(request: Request):
+    user = get_current_user(request)
+    if not user.get("config_id"):
+        return {"has_config": False}
+    conn = get_db()
+    row = conn.execute("SELECT * FROM configs WHERE id = ?", (user["config_id"],)).fetchone()
+    conn.close()
+    if not row:
+        return {"has_config": False}
+    return {"has_config": True, "id": row["id"], "uuid": row["uuid"], "name": row["name"],
+            "remarks": row["remarks"], "vless_link": generate_vless_link(row["uuid"], row["remarks"], row["name"]),
+            "domain_set": bool(CF_DOMAIN)}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped",
+            "cf_domain": CF_DOMAIN or "not set"}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
