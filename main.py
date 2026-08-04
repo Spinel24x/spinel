@@ -20,7 +20,9 @@ CF_DOMAIN = os.getenv("CF_DOMAIN", "")
 USER_PASS = os.getenv("USER_PASS", "admin123")
 PORT = int(os.getenv("PORT", "8000"))
 DB_PATH = "/app/data/panel.db"
-XRAY_PORT = 8080
+XRAY_PORT = 8080  # Railway فقط این پورت رو expose می‌کنه
+# ولی ما Xray رو روی 8081 می‌ذاریم و FastAPI رو 8080
+# Worker باید به 8081 وصل بشه برای WS
 
 print("=" * 50)
 print(f"CF_DOMAIN: {CF_DOMAIN or 'NOT SET'}")
@@ -85,7 +87,6 @@ def generate_vless_link(config_uuid: str, remarks: str = "", name: str = "") -> 
         return ""
     ws_path = f"/{config_uuid}"
     remark_text = remarks or name or "VLESS"
-    # فرمت استاندارد VLESS بدون alpn
     return (
         f"vless://{config_uuid}@{CF_DOMAIN}:443"
         f"?encryption=none&security=tls&sni={CF_DOMAIN}"
@@ -98,17 +99,21 @@ def build_xray_config():
     configs = conn.execute("SELECT * FROM configs WHERE enabled = 1").fetchall()
     conn.close()
 
-    inbounds = []
-    # همه کانفیگ‌ها روی یه پورت - Xray با path تشخیص میده
     clients = []
     for conf in configs:
         clients.append({
             "id": conf["uuid"],
             "flow": "xtls-rprx-vision"
         })
-    
-    if clients:
-        inbounds.append({
+
+    if not clients:
+        dummy_uuid = str(uuid.uuid4())
+        clients = [{"id": dummy_uuid, "flow": "xtls-rprx-vision"}]
+
+    config_data = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "listen": "0.0.0.0",
             "port": XRAY_PORT,
             "protocol": "vless",
             "settings": {
@@ -122,36 +127,16 @@ def build_xray_config():
                     "path": "/"
                 }
             }
-        })
-    else:
-        dummy_uuid = str(uuid.uuid4())
-        inbounds.append({
-            "port": XRAY_PORT,
-            "protocol": "vless",
-            "settings": {
-                "clients": [{"id": dummy_uuid, "flow": "xtls-rprx-vision"}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network": "ws",
-                "security": "none",
-                "wsSettings": {
-                    "path": "/"
-                }
-            }
-        })
-
-    config_data = {
-        "log": {"loglevel": "warning"},
-        "inbounds": inbounds,
+        }],
         "outbounds": [{"protocol": "freedom", "settings": {}}]
     }
 
     Path("/app/configs").mkdir(parents=True, exist_ok=True)
     with open("/app/configs/active.json", "w") as f:
         json.dump(config_data, f, indent=2)
-    
+
     print("XRAY CONFIG:", json.dumps(config_data, indent=2))
+    return config_data
 
 def restart_xray():
     global xray_process
@@ -161,16 +146,20 @@ def restart_xray():
             xray_process.wait(timeout=5)
     except:
         pass
+
     build_xray_config()
+    
+    # Xray رو روی پورت 8080 ران می‌کنیم
+    # FastAPI روی پورت 8000 ران میشه (ست شده توسط Railway)
     xray_process = subprocess.Popen(
         ["/usr/local/bin/xray", "run", "-config", "/app/configs/active.json"],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+        stderr=subprocess.STDOUT
     )
-    # لاگ Xray برای دیباگ
+    
     import threading
     def log_xray():
-        if xray_process.stdout:
+        if xray_process and xray_process.stdout:
             for line in xray_process.stdout:
                 print(f"XRAY: {line.decode().strip()}")
     threading.Thread(target=log_xray, daemon=True).start()
@@ -338,23 +327,6 @@ async def dashboard_page(request: Request):
     except HTTPException:
         return RedirectResponse("/login")
 
-@app.get("/test", response_class=HTMLResponse)
-async def test_page():
-    return HTMLResponse("""<!DOCTYPE html><html><head><title>API Test</title>
-<style>body{font-family:sans-serif;background:#1a1a2e;color:#fff;padding:50px;text-align:center}
-button{padding:15px 30px;margin:10px;font-size:16px;background:#7c5cfc;color:#fff;border:none;border-radius:8px;cursor:pointer}
-#result{margin-top:20px;padding:20px;background:#16213e;border-radius:8px;text-align:left;max-width:600px;margin-left:auto;margin-right:auto}</style></head><body>
-<h2>API Test Page</h2>
-<button onclick="test('/api/me')">Test /api/me</button>
-<button onclick="test('/api/configs')">Test /api/configs</button>
-<button onclick="test('/api/users')">Test /api/users</button>
-<button onclick="test('/health')">Test /health</button>
-<pre id="result">Click a button to test...</pre>
-<script>
-async function test(url){document.getElementById('result').textContent='Testing '+url+'...';
-try{var r=await fetch(url);var j=await r.json();document.getElementById('result').textContent=JSON.stringify(j,null,2);}
-catch(e){document.getElementById('result').textContent='Error: '+e.message;}}</script></body></html>""")
-
 @app.post("/api/login")
 async def api_login(response: Response, username: str = Form(...), password: str = Form(...)):
     conn = get_db()
@@ -487,14 +459,9 @@ async def my_config(request: Request):
 async def health():
     return {"status": "ok", "xray": "running" if (xray_process and xray_process.poll() is None) else "stopped", "cf_domain": CF_DOMAIN or "not set"}
 
-@app.get("/xray-config")
-async def xray_config(request: Request):
-    require_admin(request)
-    try:
-        with open("/app/configs/active.json") as f:
-            return JSONResponse(json.load(f))
-    except:
-        return {"error": "config not found"}
-
 if __name__ == "__main__":
+    # FastAPI روی پورت 8000 (که Railway به 8080 مپ می‌کنه)
+    # Xray روی 8080 داخلی
+    print(f"FastAPI starting on port {PORT}")
+    print(f"Xray will listen on port {XRAY_PORT} internally")
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
