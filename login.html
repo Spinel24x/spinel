@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - VLESS Panel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="login-card">
+            <div class="login-header">
+                <h1>🔐 VLESS Panel</h1>
+                <p>Cloudflare Worker + Railway</p>
+            </div>
+            <form id="loginForm">
+                <div class="form-group">
+                    <label for="username">👤 Username</label>
+                    <input type="text" id="username" name="username" required autocomplete="username" placeholder="admin">
+                </div>
+                <div class="form-group">
+                    <label for="password">🔑 Password</label>
+                    <input type="password" id="password" name="password" required autocomplete="current-password">
+                </div>
+                <div class="error-message" id="errorBox"></div>
+                <button type="submit" class="btn-login">Login</button>
+            </form>
+        </div>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const errorBox = document.getElementById('errorBox');
+            errorBox.style.display = 'none';
+
+            const formData = new FormData();
+            formData.append('username', document.getElementById('username').value);
+            formData.append('password', document.getElementById('password').value);
+
+            try {
+                const res = await fetch('/api/login', { method: 'POST', body: formData });
+                const data = await res.json();
+
+                if (res.ok && data.success) {
+                    window.location.href = data.redirect;
+                } else {
+                    errorBox.textContent = data.detail || 'Login failed';
+                    errorBox.style.display = 'block';
+                }
+            } catch (err) {
+                errorBox.textContent = 'Connection error. Please try again.';
+                errorBox.style.display = 'block';
+            }
+        });
+    </script>
+</body>
+</html>
