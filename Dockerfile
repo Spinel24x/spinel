@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 RUN curl -sL https://github.com/XTLS/Xray-core/releases/download/v1.8.21/Xray-linux-64.zip -o /tmp/xray.zip && \
@@ -13,7 +13,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# کپی همه فایل‌ها از جمله static و templates
+COPY main.py .
+COPY templates/ ./templates/
+COPY static/ ./static/
 
 RUN mkdir -p /app/configs /app/data
 
